@@ -1,3 +1,11 @@
+# -*- coding: utf-8 -*-
+"""
+Created on Fri Aug 10 08:21:29 2018
+
+@author: FXSIMON
+"""
+
+# coding=utf-8
 ## readgssi.py
 ## intended to translate radar data from DZT to other more workable formats.
 ## DZT is a file format maintained by Geophysical Survey Systems Incorporated (GSSI).
@@ -21,7 +29,7 @@ import numpy as np
 import matplotlib as mpl
 import matplotlib.pyplot as plt
 import matplotlib.colors as colors
-from mpl_toolkits.basemap import Basemap
+#from mpl_toolkits.basemap import Basemap
 import pandas as pd
 import math
 from decimal import Decimal
@@ -29,14 +37,30 @@ from datetime import datetime, timedelta
 import pytz
 import h5py
 import pynmea2
+from scipy import signal
 
 NAME = 'readgssi'
-VERSION = '0.0.5-dev'
+VERSION = '0.0.6-beta3'
 YEAR = 2018
 AUTHOR = 'Ian Nesbitt'
 AFFIL = 'School of Earth and Climate Sciences, University of Maine'
 
-HELP_TEXT = 'usage:\nreadgssi.py -i <input DZX> -o <output file> -f <output format: (csv|h5|segy)>\n\noptional flags:\n-v       = verbose\n-p <int> = plot output with size in inches\n-d       = input file uses DMI instrument\n-a <int> = specify antenna frequency\n-s <int> = specify trace stacking value or "auto" to autostack to ~2.5:1 x:y axis ratio'
+HELP_TEXT = '''usage:
+readgssi.py -i input.DZT [OPTIONS]
+optional flags:
+     OPTION     |      ARGUMENT       |       FUNCTIONALITY
+-v, --verbose   |                     |  verbosity
+-o, --output    | file:  /dir/f.ext   |  specify an output file
+-f, --format    | string, eg. "csv"   |  specify output format (csv is the only working format currently)
+-p, --plot      | +integer or "auto"  |  plot will be x inches high (dpi=150), or "auto". default: 10
+-c, --colormap  | string, eg. "Greys" |  specify the colormap (https://matplotlib.org/users/colormaps.html#grayscale-conversion)
+-g, --gain      | positive integer    |  gain value (higher=greater contrast, default: 1)
+-b, --colorbar  |                     |  add a colorbar to the figure
+-a, --antfreq   | positive integer    |  specify antenna frequency (read automatically if not given)
+-s, --stack     | +integer or "auto"  |  specify trace stacking value or "auto" to autostack to ~2.5:1 x:y axis ratio
+-m, --histogram |                     |  produce a histogram of data values
+'''
+
 #optional flag: -d, denoting radar pulses triggered with a distance-measuring instrument (DMI) like a survey wheel' # help text string
 
 
@@ -132,7 +156,6 @@ def readdzg(fi, frmt, spu, traces, verbose=False):
     frmt = format ('dzg' = DZG file containing gps sentence strings (see below); 'csv' = comma separated file with)
     spu = samples per unit (second or meter)
     traces = the number of traces in the file
-
     Reading DZG
     We need to relate gpstime to scan number then interpolate for each scan
     between gps measurements.
@@ -256,10 +279,21 @@ def readdzg(fi, frmt, spu, traces, verbose=False):
     return arr
 
 
-def readgssi(infile, outfile=None, antfreq=None, frmt=None, plot=False, figsize=10, stack=1, verbose=False):
+def agc(x,gain_level):
+    
+    output_power_Normal=10**(gain_level/10)
+    energy=(sum(x[:])**2)/len(x)
+    
+    K1 = np.sqrt((output_power_Normal*len(x)) / energy)
+    x_cor = [a*K1 for a in x]
+    return x_cor
+
+
+
+
+def readgssi(infile, outfile=None, antfreq=None, frmt=None, plot=False, figsize=10, stack=1, verbose=False, histogram=False, colormap='viridis', colorbar=False, gain=1):
     '''
     function to unpack and return things we need from the header, and the data itself
-
     currently unused but potentially useful lines:
     # headerstruct = '<5h 5f h 4s 4s 7h 3I d I 3c x 3h d 2x 2c s s 14s s s 12s h 816s 76s' # the structure of the bytewise header and "gps data" as I understand it - 1024 bytes
     # readsize = (2,2,2,2,2,4,4,4,4,4,2,4,4,4,2,2,2,2,2,4,4,4,8,4,3,1,2,2,2,8,1,1,14,1,1,12,2) # the variable size of bytes in the header (most of the time) - 128 bytes
@@ -318,11 +352,11 @@ def readgssi(infile, outfile=None, antfreq=None, frmt=None, plot=False, figsize=
                     f.seek(MINHEADSIZE * rh_nchan)
 
                 if rh_bits == 8:
-                    data = np.fromfile(f, np.uint8).reshape(-1,rh_nsamp).T # 8-bit
+                    data = np.fromfile(f, np.uint8).reshape(-1,(rh_nsamp*rh_nchan)).T # 8-bit
                 elif rh_bits == 16:
-                    data = np.fromfile(f, np.uint16).reshape(-1,rh_nsamp).T # 16-bit
+                    data = np.fromfile(f, np.uint16).reshape(-1,(rh_nsamp*rh_nchan)).T # 16-bit
                 else:
-                    data = np.fromfile(f, np.int32).reshape(-1,rh_nsamp).T # 32-bit
+                    data = np.fromfile(f, np.int32).reshape(-1,(rh_nsamp*rh_nchan)).T # 32-bit
 
                 # create dictionary
                 returns = {
@@ -449,7 +483,6 @@ def readgssi(infile, outfile=None, antfreq=None, frmt=None, plot=False, figsize=
                 - marks are made at same time on GPS and SIR
                 - gps and gpr are in same location when mark is made
                 - good quality horizontal solution
-
                 single-channel IceRadar h5 structure is
                 /line_x/location_n/datacapture_0/echogram_0 (/group/group/group/dataset)
                 each dataset has an 'attributes' item attached, formatted in 'collections.defaultdict' style:
@@ -522,13 +555,25 @@ def readgssi(infile, outfile=None, antfreq=None, frmt=None, plot=False, figsize=
             let's do some matplotlib
             '''
             arr = r[1].astype(np.float32)
-            #img_arr = arr[abs(int(r[0]['rhf_position'])+5):r[0]['rh_nsamp']]
-            img_arr = arr[abs(int(90)+5):r[0]['rh_nsamp']]
-
-            new_arr = {}
             chans = list(range(r[0]['rh_nchan']))
+            img_arr = arr[abs(int(47)):r[0]['rh_nchan']*r[0]['rh_nsamp']]
+            new_arr = {}
             for ar in chans:
-                new_arr[ar] = img_arr[:,:int(img_arr.shape[1]/r[0]['rh_nchan'])]
+                a=[]
+                a=img_arr[abs(int(47))+(ar)*r[0]['rh_nsamp']:(ar+1)*r[0]['rh_nsamp']-abs(int(47))]
+                
+                #dewow filter
+                x=range(len(zip(*a)[100]))
+                y=zip(*a)[100]
+                model = np.polyfit(x,y, 8)
+                predicted = list(np.polyval(model, x))
+#
+                for j in range(len(a[0])):
+                    for i in range(len(a)):
+                        a[i][j]= a[i][j] - predicted[i]
+  
+                new_arr[ar] = a[:,:int(img_arr.shape[1])]
+                
             img_arr = new_arr
             del new_arr
 
@@ -540,12 +585,14 @@ def readgssi(infile, outfile=None, antfreq=None, frmt=None, plot=False, figsize=
                 else:
                     outname = os.path.split(infile)[-1].split('.')[:-1][0]
 
+                    
+                    
                 if str(j).lower() in 'auto':
                     #print('automatic stacking method not implemented yet. no stacking value applied.')
                     print('attempting automatic stacking method...')
                     ratio = (img_arr[ar].shape[1]/img_arr[ar].shape[0])/(7500/3000)
                     if ratio > 1:
-                        j = round(ratio)
+                        j = int(ratio)
                     else:
                         j = 1
                 else:
@@ -565,14 +612,17 @@ def readgssi(infile, outfile=None, antfreq=None, frmt=None, plot=False, figsize=
                         stack[:,s] = stack[:,s] + img_arr[ar][:,s*j+1:s*j+j].sum(axis=1)
                     img_arr[ar] = stack
                 else:
-                    print('no stacking applied. be warned: this can result in very large and awkwardly-shaped figures.')
+                    if str(j).lower() in 'auto':
+                        pass
+                    else:
+                        print('no stacking applied. be warned: this can result in very large and awkwardly-shaped figures.')
 
                 mean = np.mean(img_arr[ar])
                 if abs(mean) >= 10:
-                    print('mean: %s (mean is >10, so recentering array values by this amount)' % mean)
+                    print('mean: %s (mean is greater than 10, so recentering array values by this amount)' % mean)
                     img_arr[ar] = img_arr[ar] - mean
                 else:
-                    print('mean: %s (mean < 10; not recentering array)' % mean)
+                    print('mean: %s (mean is less than 10; not recentering array)' % mean)
                 std = np.std(img_arr[ar])
                 print('std:  %s' % std)
                 ll = -std * 3 # lower color limit (1/10 of a standard deviation works well for 100MHz in a lake)
@@ -582,22 +632,42 @@ def readgssi(infile, outfile=None, antfreq=None, frmt=None, plot=False, figsize=
 
                 # having lots of trouble with this line not being friendly with figsize tuple (integer coercion-related errors)
                 # so we will force everything to be integers explicitly
-                figx, figy = int(int(figsize)*int(int(img_arr[ar].shape[1])/int(img_arr[ar].shape[0]))), int(figsize) # force to integer instead of coerce
-                print('plotting %sx%sin image...' % (figx, figy))
 
-                fig = plt.figure(figsize=(figx, figy), dpi=150, constrained_layout=True)
-                img = plt.imshow(img_arr[ar], cmap='viridis', clim=(ll, ul),
-                                 norm=colors.SymLogNorm(linthresh=std, linscale=1,
+                if figsize != 'auto':
+                    figx, figy = int(int(figsize)*int(int(img_arr[ar].shape[1])/int(img_arr[ar].shape[0]))), int(figsize) # force to integer instead of coerce
+                    print('plotting %sx%sin image with gain=%s...' % (figx, figy, gain))
+                    fig = plt.figure(figsize=(figx, figy))#, dpi=150, constrained_layout=True)
+                else:
+                    print('plotting with gain=%s...' % gain)
+                    fig = plt.figure(constrained_layout=True)
+                
+                try:
+                    img = plt.imshow(img_arr[ar], cmap=colormap, clim=(ll, ul),
+                                 norm=colors.SymLogNorm(linthresh=float(std)/float(gain), linscale=1,
                                                         vmin=ll, vmax=ul),)
-                fig.colorbar(img)
-                plt.title('%s - %s MHz - stacking: %s' % (os.path.split(infile)[-1], ANT[r[0]['rh_antname']][fi], j))
-                print('saving figure as %s_%sMHz.png' % (os.path.splitext(infile)[0], ANT[r[0]['rh_antname']][fi]))
-                plt.savefig(os.path.join(os.path.splitext(infile)[0] + '_' + str(ANT[r[0]['rh_antname']][fi]) + 'MHz.png'))
+                except:
+                    print('matplotlib did not accept colormap "%s", using viridis instead' % colormap)
+                    print('see examples here: https://matplotlib.org/users/colormaps.html#grayscale-conversion')
+                    img = plt.imshow(img_arr[ar], cmap='viridis', clim=(ll, ul),
+                                 norm=colors.SymLogNorm(linthresh=float(std)/float(gain), linscale=1,
+                                                        vmin=ll, vmax=ul),)                
+
+                if colorbar:
+                    fig.colorbar(img)
+                plt.title('%s - %s MHz - stacking: %s - gain: %s' % (os.path.split(infile)[-1], ANT[r[0]['rh_antname']][fi], j, gain))
+                if outfile:
+                    print('saving figure as %s.png' % (os.path.splitext(outfile)[0]))
+                    plt.savefig(os.path.join(os.path.splitext(outfile)[0] + '.png'))
+                else:
+                    print('saving figure as %s_%sMHz.png' % (os.path.splitext(infile)[0], ANT[r[0]['rh_antname']][fi]))
+                    plt.savefig(os.path.join(os.path.splitext(infile)[0] + '_' + str(ANT[r[0]['rh_antname']][fi]) + 'MHz.png'))
                 plt.show()
-                print('drawing histogram...')
-                fig = plt.figure(figsize=(10,6))
-                hst = plt.hist(img_arr[ar].ravel(), bins=256, range=(ll, ul), fc='k', ec='k')
-                plt.show()
+                
+                if histogram:
+                    print('drawing histogram...')
+                    fig = plt.figure()
+                    hst = plt.hist(img_arr[ar].ravel(), bins=256, range=(ll, ul), fc='k', ec='k')
+                    plt.show()
                 fi += 1
 
     except TypeError as e: # shows up when the user selects an input file that doesn't exist
@@ -613,13 +683,13 @@ if __name__ == "__main__":
 
     verbose = False
     stack = 1
-    infile, outfile, antfreq, frmt, plot, figsize = None, None, None, None, None, None
+    infile, outfile, antfreq, frmt, plot, figsize, histogram, colormap, colorbar, gain = None, None, None, None, None, None, None, None, None, None
 
 
 # some of this needs to be tweaked to formulate a command call to one of the main body functions
 # variables that can be passed to a body function: (infile, outfile, antfreq=None, frmt, plot=False, stack=1)
     try:
-        opts, args = getopt.getopt(sys.argv[1:],'hvdi:a:o:f:p:s:',['help','verbose','dmi','input=','antfreq=','output=','format=','plot=','stack='])
+        opts, args = getopt.getopt(sys.argv[1:],'hvdi:a:o:f:p:s:mc:bg:',['help','verbose','dmi','input=','antfreq=','output=','format=','plot=','stack=','histogram','colormap=','colorbar','gain='])
     # the 'no option supplied' error
     except getopt.GetoptError as e:
         print('error: invalid argument(s) supplied')
@@ -628,7 +698,7 @@ if __name__ == "__main__":
         sys.exit(2)
     for opt, arg in opts: 
         if opt in ('-h', '--help'): # the help case
-            print(u'Copyright %s %s %s' % (u'\u00a9', AUTHOR, YEAR))
+            print(u'Copyleft %s %s %s' % (u'\U0001F12F', AUTHOR, YEAR))
             print(AFFIL + '\n')
             print(HELP_TEXT)
             sys.exit()
@@ -646,7 +716,7 @@ if __name__ == "__main__":
                     outfile = os.path.expanduser(infile) # expand tilde, see above
         if opt in ('-a', '--freq'):
             try:
-                antfreq = round(float(arg),1)
+                antfreq = round(float(abs(arg)),1)
             except:
                 print('error: %s is not a valid decimal or integer frequency value.' % arg)
                 print(HELP_TEXT)
@@ -672,14 +742,13 @@ if __name__ == "__main__":
                 sys.exit(2)
         if opt in ('-s', '--stack'):
             if arg:
-                if 'auto' in arg.lower():
-                    stack = arg.lower()
+                if 'auto' in str(arg).lower():
+                    stack = 'auto'
                 else:
                     try:
-                        int(arg)
-                        stack = arg
+                        stack = abs(int(arg))
                     except ValueError:
-                        print('error: stacking argument must be an integer or "auto".')
+                        print('error: stacking argument must be a positive integer or "auto".')
                         print(HELP_TEXT)
                         sys.exit(2)
             else:
@@ -687,19 +756,44 @@ if __name__ == "__main__":
         if opt in ('-p', '--plot'):
             plot = True
             if arg:
-                try:
-                    int(arg)
-                    figsize = arg
-                except:
-                    print('error: plot size must be given in numeric format.')
-                    print(HELP_TEXT)
-                    sys.exit(2)
+                if 'auto' in arg.lower():
+                    figsize = str(arg).lower()
+                else:
+                    try:
+                        figsize = abs(int(arg))
+                    except ValueError:
+                        print('error: plot size argument must be a positive integer or "auto".')
+                        print(HELP_TEXT)
+                        sys.exit(2)
             else:
                 figsize = 10
         if opt in ('-d', '--dmi'):
             #dmi = True
             print('DMI devices are not supported at the moment.')
             pass # not doing anything with this at the moment
+        if opt in ('-m', '--histogram'):
+            histogram = True
+        if opt in ('-c', '--colormap'):
+            if arg:
+                colormap = arg
+            else:
+                colormap = 'Greys'
+        else:
+            colormap = 'Greys'
+        if opt in ('-b', '--colorbar'):
+            colorbar = True
+        if opt in ('-g', '--gain'):
+            if arg:
+                try:
+                    gain = abs(int(arg))
+                except:
+                    print('gain must be positive. defaulting to gain=1.')
+                    gain = 1
+            else:
+                gain = 1
+        else:
+            gain = 1
+
 
     # call the function with the values we just got
     if infile:
@@ -707,7 +801,7 @@ if __name__ == "__main__":
             pass
         else:
             verbose = True
-        readgssi(infile, outfile, antfreq, frmt, plot, figsize, stack, verbose)
+        readgssi(infile, outfile, antfreq, frmt, plot, figsize, stack, verbose, histogram, colormap, colorbar, gain)
     else:
         print(HELP_TEXT)
 
